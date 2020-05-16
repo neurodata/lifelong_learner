@@ -1,32 +1,46 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[86]:
-
-
-import matplotlib.pyplot as plt
-import pickle
-from skimage.transform import rotate
-from scipy import ndimage
-from skimage.util import img_as_ubyte
-from joblib import Parallel, delayed
-from sklearn.ensemble.forest import _generate_unsampled_indices
-from sklearn.ensemble.forest import _generate_sample_indices
+#%%
 import numpy as np
-from sklearn.ensemble import BaggingClassifier
-from sklearn.tree import DecisionTreeClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tqdm
+import pickle
 from itertools import product
 
-#import sys
-#sys.path.append("../lifelong_learner")
-#from lf import LF
+from sklearn.ensemble.forest import _generate_unsampled_indices
+from sklearn.ensemble.forest import _generate_sample_indices
 
-get_ipython().run_line_magic('matplotlib', 'inline')
+from sklearn.ensemble import BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+from tqdm import tqdm_notebook as tqdm
+
+from joblib import Parallel, delayed
+
+#Infrastructure
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.utils.validation import NotFittedError
+
+#Data Handling
+from sklearn.utils.validation import (
+    check_X_y,
+    check_array,
+    NotFittedError,
+)
+from sklearn.utils.multiclass import check_classification_targets
+
+#Utils
+import numpy as np
+
+from tqdm import tqdm
+from sklearn.base import clone 
+
+def unpickle(file):
+    with open(file, 'rb') as fo:
+        dict = pickle.load(fo, encoding='bytes')
+    return dict
 
 
-# In[87]:
-
-
+#%%
 def unpickle(file):
     with open(file, 'rb') as fo:
         dict = pickle.load(fo, encoding='bytes')
@@ -36,10 +50,318 @@ def homogenize_labels(a):
     u = np.unique(a)
     return np.array([np.where(u == i)[0][0] for i in a])
 
+#%%
+def _finite_sample_correction(posteriors, num_points_in_partition, num_classes):
+    '''
+    encourage posteriors to approach uniform when there is low data
+    '''
+    correction_constant = 1 / (num_classes * num_points_in_partition)
 
-# In[88]:
+    zero_posterior_idxs = np.where(posteriors == 0)[0]
 
+    c = len(zero_posterior_idxs) / (num_classes * num_points_in_partition)
+    posteriors *= (1 - c)
+    posteriors[zero_posterior_idxs] = correction_constant
+    return posteriors
 
+class UncertaintyForest(BaseEstimator, ClassifierMixin):
+    '''
+    based off of https://arxiv.org/pdf/1907.00325.pdf
+    '''
+    def __init__(
+        self,
+        max_depth=30,
+        min_samples_leaf=1,
+        max_samples = 0.32,
+        max_features_tree = "auto",
+        n_estimators=200,
+        bootstrap=False,
+        parallel=True):
+
+        #Tree parameters.
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.max_features_tree = max_features_tree
+
+        #Bag parameters
+        self.n_estimators = n_estimators
+        self.bootstrap = bootstrap
+        self.max_samples = max_samples
+
+        #Model parameters.
+        self.parallel = parallel
+        self.fitted = False
+
+    def _check_fit(self):
+        '''
+        raise a NotFittedError if the model isn't fit
+        '''
+        if not self.fitted:
+                msg = (
+                        "This %(name)s instance is not fitted yet. Call 'fit' with "
+                        "appropriate arguments before using this estimator."
+                )
+                raise NotFittedError(msg % {"name": type(self).__name__})
+
+    def transform(self, X):
+        '''
+        get the estimated posteriors across trees
+        '''
+        X = check_array(X)
+                
+        def worker(tree_idx, tree):
+            #get the nodes of X
+            # Drop each estimation example down the tree, and record its 'y' value.
+            return tree.apply(X)
+            
+
+        if self.parallel:
+            return np.array(
+                    Parallel(n_jobs=-1)(
+                            delayed(worker)(tree_idx, tree) for tree_idx, tree in enumerate(self.ensemble.estimators_)
+                    )
+            )         
+        else:
+            return np.array(
+                    [worker(tree_idx, tree) for tree_idx, tree in enumerate(self.ensemble.estimators_)]
+                    )
+        
+    def get_transformer(self):
+        return lambda X : self.transform(X)
+        
+    def vote(self, nodes_across_trees):
+        return self.voter.predict(nodes_across_trees)
+        
+    def get_voter(self):
+        return self.voter
+        
+                        
+    def fit(self, X, y):
+
+        #format X and y
+        X, y = check_X_y(X, y)
+        check_classification_targets(y)
+        self.classes_, y = np.unique(y, return_inverse=True)
+        
+        #define the ensemble
+        self.ensemble = BaggingClassifier(
+            DecisionTreeClassifier(
+                max_depth=self.max_depth,
+                min_samples_leaf=self.min_samples_leaf,
+                max_features=self.max_features_tree
+            ),
+            n_estimators=self.n_estimators,
+            max_samples=self.max_samples,
+            bootstrap=self.bootstrap,
+            n_jobs = -1
+        )
+        
+        #fit the ensemble
+        self.ensemble.fit(X, y)
+        
+        class Voter(BaseEstimator):
+            def __init__(self, estimators_samples_, classes, parallel = True):
+                self.n_estimators = len(estimators_samples_)
+                self.classes_ = classes
+                self.parallel = parallel
+                self.estimators_samples_ = estimators_samples_
+            
+            def fit(self, nodes_across_trees, y, fitting = False):
+                self.tree_idx_to_node_ids_to_posterior_map = {}
+
+                def worker(tree_idx):
+                    nodes = nodes_across_trees[tree_idx]
+                    oob_samples = np.delete(range(len(nodes)), self.estimators_samples_[tree_idx])
+                    cal_nodes = nodes[oob_samples] if fitting else nodes
+                    y_cal = y[oob_samples] if fitting else y                    
+                    
+                    #create a map from the unique node ids to their classwise posteriors
+                    node_ids_to_posterior_map = {}
+
+                    #fill in the posteriors 
+                    for node_id in np.unique(cal_nodes):
+                        cal_idxs_of_node_id = np.where(cal_nodes == node_id)[0]
+                        cal_ys_of_node = y_cal[cal_idxs_of_node_id]
+                        class_counts = [len(np.where(cal_ys_of_node == y)[0]) for y in np.unique(y) ]
+                        posteriors = np.nan_to_num(np.array(class_counts) / np.sum(class_counts))
+
+                        #finite sample correction
+                        posteriors_corrected = _finite_sample_correction(posteriors, len(cal_idxs_of_node_id), len(self.classes_))
+                        node_ids_to_posterior_map[node_id] = posteriors_corrected
+
+                    #add the node_ids_to_posterior_map to the overall tree_idx map 
+                    self.tree_idx_to_node_ids_to_posterior_map[tree_idx] = node_ids_to_posterior_map
+                    
+                for tree_idx in range(self.n_estimators):
+                        worker(tree_idx)
+                return self
+                        
+                        
+            def predict_proba(self, nodes_across_trees):
+                def worker(tree_idx):
+                    #get the node_ids_to_posterior_map for this tree
+                    node_ids_to_posterior_map = self.tree_idx_to_node_ids_to_posterior_map[tree_idx]
+
+                    #get the nodes of X
+                    nodes = nodes_across_trees[tree_idx]
+
+                    posteriors = []
+                    node_ids = node_ids_to_posterior_map.keys()
+
+                    #loop over nodes of X
+                    for node in nodes:
+                        #if we've seen this node before, simply get the posterior
+                        if node in node_ids:
+                            posteriors.append(node_ids_to_posterior_map[node])
+                        #if we haven't seen this node before, simply use the uniform posterior 
+                        else:
+                            posteriors.append(np.ones((len(np.unique(self.classes_)))) / len(self.classes_))
+                    return posteriors
+
+                if self.parallel:
+                    return np.mean(
+                            Parallel(n_jobs=-1)(
+                                    delayed(worker)(tree_idx) for tree_idx in range(self.n_estimators)
+                            ), axis = 0
+                    )
+
+                else:
+                    return np.mean(
+                            [worker(tree_idx) for tree_idx in range(self.n_estimators)], axis = 0)
+                
+        #get the nodes of the calibration set
+        nodes_across_trees = self.transform(X) 
+        self.voter = Voter(estimators_samples_ = self.ensemble.estimators_samples_, classes = self.classes_, parallel = self.parallel)
+        self.voter.fit(nodes_across_trees, y, fitting = True)
+        self.fitted = True
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=-1)]
+
+    def predict_proba(self, X):
+        return self.voter.predict_proba(self.transform(X))
+
+#%%
+class LifeLongForest():
+    def __init__(self, acorn = None, verbose = False, model = "uf"):
+        self.X_across_tasks = []
+        self.y_across_tasks = []
+        
+        self.transformers_across_tasks = []
+        
+        #element [i, j] votes on decider from task i under representation from task j
+        self.voters_across_tasks_matrix = []
+        self.n_tasks = 0
+        
+        self.classes_across_tasks = []
+        
+        if acorn is not None:
+            np.random.seed(acorn)
+        
+        self.verbose = verbose
+        
+        self.model = model
+        
+    def check_task_idx_(self, task_idx):
+        if task_idx >= self.n_tasks:
+            raise Exception("Invalid Task IDX")
+    
+    def new_forest(self, 
+                   X, 
+                   y, 
+                   epochs = 100, 
+                   lr = 5e-4, 
+                   n_estimators = 10, 
+                   max_samples = .63,
+                   bootstrap = True,
+                   max_depth = 30,
+                   min_samples_leaf = 1,
+                   acorn = None):
+        
+        #if self.model == "dnn":
+        #    from honest_dnn import HonestDNN 
+        #if self.model == "uf":
+        #    from uncertainty_forest import UncertaintyForest
+        
+        self.X_across_tasks.append(X)
+        self.y_across_tasks.append(y)
+        
+        if self.model == "dnn":
+            new_honest_dnn = HonestDNN(verbose = self.verbose)
+            new_honest_dnn.fit(X, y, epochs = epochs, lr = lr)
+        if self.model == "uf":
+            new_honest_dnn = UncertaintyForest(n_estimators = n_estimators,
+                                               max_samples = max_samples,
+                                               bootstrap = bootstrap,
+                                               max_depth = max_depth,
+                                               min_samples_leaf = min_samples_leaf,
+                                               parallel = True)
+            new_honest_dnn.fit(X, y)
+        new_transformer = new_honest_dnn.get_transformer()
+        new_voter = new_honest_dnn.get_voter()
+        new_classes = new_honest_dnn.classes_
+        
+        self.transformers_across_tasks.append(new_transformer)
+        self.classes_across_tasks.append(new_classes)
+        
+        #add one voter to previous task voter lists under the new transformation
+        for task_idx in range(self.n_tasks):
+            X_of_task, y_of_task = self.X_across_tasks[task_idx], self.y_across_tasks[task_idx]
+            if self.model == "dnn":
+                X_of_task_under_new_transform = new_transformer.predict(X_of_task) 
+            if self.model == "uf":
+                X_of_task_under_new_transform = new_transformer(X_of_task) 
+            unfit_task_voter_under_new_transformation = clone(self.voters_across_tasks_matrix[task_idx][0])
+            if self.model == "uf":
+                unfit_task_voter_under_new_transformation.classes_ = self.voters_across_tasks_matrix[task_idx][0].classes_
+            task_voter_under_new_transformation = unfit_task_voter_under_new_transformation.fit(X_of_task_under_new_transform, y_of_task)
+
+            self.voters_across_tasks_matrix[task_idx].append(task_voter_under_new_transformation)
+            
+        #add n_tasks voters to new task voter list under previous transformations 
+        new_voters_under_previous_task_transformation = []
+        for task_idx in range(self.n_tasks):
+            transformer_of_task = self.transformers_across_tasks[task_idx]
+            if self.model == "dnn":
+                X_under_task_transformation = transformer_of_task.predict(X)
+            if self.model == "uf":
+                X_under_task_transformation = transformer_of_task(X)
+            unfit_new_task_voter_under_task_transformation = clone(new_voter)
+            if self.model == "uf":
+                unfit_new_task_voter_under_task_transformation.classes_ = new_voter.classes_
+            new_task_voter_under_task_transformation = unfit_new_task_voter_under_task_transformation.fit(X_under_task_transformation, y)
+            new_voters_under_previous_task_transformation.append(new_task_voter_under_task_transformation)
+            
+        #make sure to add the voter of the new task under its own transformation
+        new_voters_under_previous_task_transformation.append(new_voter)
+        
+        self.voters_across_tasks_matrix.append(new_voters_under_previous_task_transformation)
+        
+        self.n_tasks += 1
+        
+    def _estimate_posteriors(self, X, representation = 0, decider = 0):
+        self.check_task_idx_(decider)
+        
+        if representation == "all":
+            representation = range(self.n_tasks)
+        elif isinstance(representation, int):
+            representation = np.array([representation])
+        
+        posteriors_across_tasks = []
+        for transformer_task_idx in representation:
+            transformer = self.transformers_across_tasks[transformer_task_idx]
+            voter = self.voters_across_tasks_matrix[decider][transformer_task_idx]
+            if self.model == "dnn":
+                posteriors_across_tasks.append(voter.predict_proba(transformer.predict(X)))
+            if self.model == "uf":
+                posteriors_across_tasks.append(voter.predict_proba(transformer(X)))
+        return np.mean(posteriors_across_tasks, axis = 0)
+    
+    def predict(self, X, representation = 0, decider = 0):
+        task_classes = self.classes_across_tasks[decider]
+        return task_classes[np.argmax(self._estimate_posteriors(X, representation, decider), axis = -1)] 
+
+#%%
 def cross_val_data(data_x, data_y, class_idx, task, cv=1):
     x = data_x.copy()
     y = data_y.copy()
@@ -63,207 +385,6 @@ def cross_val_data(data_x, data_y, class_idx, task, cv=1):
         
         
     return train_x, train_y, test_x, test_y
-
-
-# In[89]:
-
-
-class LifelongForest:
-    """
-    Lifelong Forest class.
-    """
-    def __init__(self, acorn=None):
-        """
-        Two major things the Forest Class needs access to:
-            1) the realized random forest model (self.models_ is a list of forests, 1 for each task)
-            2) old data (to update posteriors when a new task is introduced)
-        """
-        self.models_ = []
-        self.X_ = []
-        self.y_ = []
-        self.n_tasks = 0
-        self.n_classes = None
-        if acorn is not None:
-            np.random.seed(acorn)
-    def new_forest(self, X, y, n_estimators=200, max_samples=0.32,
-                        bootstrap=True, max_depth=30, min_samples_leaf=1,
-                        acorn=None):
-        """
-        Input
-        X: an array-like object of features; X.shape == (n_samples, n_features)
-        y: an array-like object of class labels; len(y) == n_samples
-        n_estimators: int; number of trees to construct (default = 200)
-        max_samples: float in (0, 1]: number of samples to consider when 
-            constructing a new tree (default = 0.32)
-        bootstrap: bool; If True then the samples are sampled with replacement
-        max_depth: int; maximum depth of a tree
-        min_samples_leaf: int; minimum number of samples in a leaf node
-        Return
-        model: a BaggingClassifier fit to X, y
-        """
-        if X.ndim == 1:
-            raise ValueError('1d data will cause headaches down the road')
-        if acorn is not None:
-            np.random.seed(acorn)
-        self.X_.append(X)
-        self.y_.append(y)
-        n = X.shape[0]
-        K = len(np.unique(y))
-        if self.n_classes is None:
-            self.n_classes = K
-        max_features = int(np.ceil(np.sqrt(X.shape[1])))
-        model=BaggingClassifier(DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf,
-                                                         max_features = max_features),
-                                  n_estimators=n_estimators,
-                                  max_samples=max_samples,
-                                  bootstrap=bootstrap)
-        model.fit(X, y)
-        self.models_.append(model)
-        self.n_tasks += 1
-        self.n_classes = len(np.unique(y))
-        return model
-    def _get_leaves(self, estimator):
-        """
-        Internal function to get leaf node ids of estimator.
-        Input
-        estimator: a fit DecisionTreeClassifier
-        Return
-        leaf_ids: numpy array; an array of leaf node ids
-        Usage
-        _estimate_posteriors(..)
-        """
-        # adapted from https://scikit-learn.org/stable/auto_examples/tree/plot_unveil_tree_structure.html
-        n_nodes = estimator.tree_.node_count
-        children_left = estimator.tree_.children_left
-        children_right = estimator.tree_.children_right
-        feature = estimator.tree_.feature
-        threshold = estimator.tree_.threshold
-        leaf_ids = []
-        stack = [(0, -1)] 
-        while len(stack) > 0:
-            node_id, parent_depth = stack.pop()
-            # If we have a test node
-            if (children_left[node_id] != children_right[node_id]):
-                stack.append((children_left[node_id], parent_depth + 1))
-                stack.append((children_right[node_id], parent_depth + 1))
-            else:
-                leaf_ids.append(node_id)
-        return np.array(leaf_ids)
-    def _finite_sample_correction(self, class_probs, row_sums):
-        """
-        An internal function for finite sample correction of posterior estimation.
-        Input
-        class_probs: numpy array; array of posteriors to correct
-        row_sums: numpy array; array of partition counts
-        Output
-        class_probs: numpy array; finite sample corrected posteriors
-        Usage
-        _estimate_posteriors(..)
-        """
-        where_0 = np.argwhere(class_probs == 0)
-        for elem in where_0:
-            class_probs[elem[0], elem[1]] = 1 / (2 * row_sums[elem[0], None])
-        where_1 = np.argwhere(class_probs == 1)
-        for elem in where_1:
-            class_probs[elem[0], elem[1]] = 1 - 1 / (2 * row_sums[elem[0], None])
-        return class_probs
-    def _estimate_posteriors(self, test, representation=0, decider=0, subsample=1, acorn=None):
-        """
-        An internal function to estimate the posteriors.
-        Input
-        task_number: int; indicates which model in self.model_ to use
-        test: array-like; test observation
-        in_task: bool; True if test is an in-task observation(s)
-        subsample: float in (0, 1]; proportion of out-of-task samples to use to
-            estimate posteriors
-        Return
-        probs: numpy array; probs[i, k] is the probability of observation i
-            being class k
-        Usage
-        predict(..)
-        """
-        if acorn is not None:
-            acorn = np.random.seed(acorn)
-        if representation==decider:
-            in_task=True
-        else:
-            in_task=False
-        train = self.X_[decider]
-        y = self.y_[decider]
-        model = self.models_[representation]
-        n, d = train.shape
-        if test.ndim > 1:
-            m, d_ = test.shape
-        else:
-            m = len(test)
-            d_ = 1
-        size = len(np.unique(y))
-        class_counts = np.zeros((m, size))
-        for tree in model:
-            # get out of bag indicies
-            if in_task:
-                prob_indices = _generate_unsampled_indices(tree.random_state, n)
-                # in_bag_idx = _generate_sample_indices(tree.random_state, n) # this is not behaving as i expected
-            else:
-                prob_indices = np.random.choice(range(n), size=int(subsample*n), replace=False)
-            leaf_nodes = self._get_leaves(tree)
-            unique_leaf_nodes = np.unique(leaf_nodes)
-            # get all node counts
-            node_counts = tree.tree_.n_node_samples
-            # get probs for eval samples
-            posterior_class_counts = np.zeros((len(unique_leaf_nodes), size))
-            for prob_index in prob_indices:
-                temp_node = tree.apply(train[prob_index].reshape(1, -1)).item()
-                #print(y[prob_index], size, np.unique(y))
-                posterior_class_counts[np.where(unique_leaf_nodes == temp_node)[0][0], y[prob_index]] += 1
-            # total number of points in a node
-            row_sums = posterior_class_counts.sum(axis=1)
-            # no divide by zero
-            row_sums[row_sums == 0] = 1
-            # posteriors
-            class_probs = (posterior_class_counts / row_sums[:, None])
-            # posteriors with finite sampling correction
-            class_probs = self._finite_sample_correction(class_probs, row_sums)
-            # posteriors as a list
-            class_probs.tolist()
-            partition_counts = np.asarray([node_counts[np.where(unique_leaf_nodes == x)[0][0]] for x in tree.apply(test)])
-            # get probability for out of bag samples
-            eval_class_probs = [class_probs[np.where(unique_leaf_nodes == x)[0][0]] for x in tree.apply(test)]
-            eval_class_probs = np.array(eval_class_probs)
-            # find total elements for out of bag samples
-            elems = np.multiply(eval_class_probs, partition_counts[:, np.newaxis])
-            # store counts for each x (repeat fhis for each tree)
-            class_counts += elems
-        # calculate p(y|X = x) for all x's
-        probs = class_counts / class_counts.sum(axis=1, keepdims=True)
-        return probs
-    def predict(self, test, representation=0, decider='all', subsample=1, acorn=None):
-        """
-        Predicts the class labels for each sample in test.
-        Input
-        test: array-like; either a 1d array of length n_features
-            or a 2d array of shape (m, n_features) 
-        task_number: int; task number 
-        """
-        size=len(np.unique(self.y_[decider]))
-        sum_posteriors = np.zeros((test.shape[0], size))
-        if representation is 'all':
-            for i in range(self.n_tasks):
-                sum_posteriors += self._estimate_posteriors(test,
-                                                            i,
-                                                            decider,
-                                                            subsample,
-                                                            acorn)
-        else:
-            sum_posteriors += self._estimate_posteriors(test,
-                                                        representation,
-                                                        decider,
-                                                        subsample,
-                                                        acorn)
-        return np.argmax(sum_posteriors, axis=1)
-
-
-
 # In[90]:
 
 
@@ -272,7 +393,7 @@ def LF_experiment(train_x, train_y, test_x, test_y, task, ntrees, cv, acorn=None
         np.random.seed(acorn)
        
     m = 1000
-    lifelong_forest = LifelongForest()
+    lifelong_forest = LifeLongForest()
     lifelong_forest.new_forest(train_x, 
                                homogenize_labels(train_y), n_estimators=ntrees)
         
@@ -295,7 +416,7 @@ def run_parallel_exp(data_x, data_y, class_idx, ntrees, task):
         
     err /= 6
     
-    with open('/data/Jayanta/continual-learning/control_res/task'+str(task)+'_'+str(ntrees),'wb') as f:
+    with open('../result/task_'+str(task)+'_'+str(ntrees),'wb') as f:
         pickle.dump(err,f)
 
 
@@ -303,7 +424,7 @@ def run_parallel_exp(data_x, data_y, class_idx, ntrees, task):
 
 
 n_tasks = 10
-train_file = '/data/Jayanta/lifelong-learning_jd/cef/cifar100/cifar-100-python/train'
+train_file = '/data/Jayanta/continual-learning/train'
 unpickled_train = unpickle(train_file)
 train_keys = list(unpickled_train.keys())
 fine_labels = np.array(unpickled_train[train_keys[2]])
@@ -313,7 +434,7 @@ labels = fine_labels
 # In[93]:
 
 
-test_file = '/data/Jayanta/lifelong-learning_jd/cef/cifar100/cifar-100-python/test'
+test_file = '/data/Jayanta/continual-learning/test'
 unpickled_test = unpickle(test_file)
 test_keys = list(unpickled_test.keys())
 fine_labels = np.array(unpickled_test[test_keys[2]])
@@ -332,8 +453,8 @@ class_idx = [np.where(data_y == u)[0] for u in np.unique(data_y)]
 # In[ ]:
 
 
-trees = range(1200,5000,100)
-task = range(1,2)
+trees = range(10,300,10)
+task = range(0,10)
 iterable = product(task,trees)
 
 Parallel(n_jobs=-2,verbose=1)(delayed(run_parallel_exp)(data_x, data_y, class_idx, ntrees, task_) for task_,ntrees in iterable)
