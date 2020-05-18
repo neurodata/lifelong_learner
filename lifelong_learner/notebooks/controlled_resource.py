@@ -75,7 +75,7 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
         max_samples = 0.63,
         max_features_tree = "auto",
         n_estimators=200,
-        bootstrap=True,
+        bootstrap=False,
         parallel=True):
 
         #Tree parameters.
@@ -416,7 +416,7 @@ def run_parallel_exp(data_x, data_y, class_idx, ntrees, task):
         
     err /= 6
     
-    with open('../result/task_'+str(task)+'_'+str(ntrees),'wb') as f:
+    with open('../result/task_'+str(task)+'__'+str(ntrees),'wb') as f:
         pickle.dump(err,f)
 
 
@@ -454,10 +454,10 @@ class_idx = [np.where(data_y == u)[0] for u in np.unique(data_y)]
 
 
 trees = range(10,300,10)
-task = range(0,10)
+task = range(6,10)
 iterable = product(task,trees)
 
-Parallel(n_jobs=-2,verbose=1)(delayed(run_parallel_exp)(data_x, data_y, class_idx, ntrees, task_) for task_,ntrees in iterable)
+Parallel(n_jobs=30,verbose=1)(delayed(run_parallel_exp)(data_x, data_y, class_idx, ntrees, task_) for task_,ntrees in iterable)
 
 
 # In[ ]:
