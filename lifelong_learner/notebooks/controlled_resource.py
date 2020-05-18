@@ -58,10 +58,10 @@ def _finite_sample_correction(posteriors, num_points_in_partition, num_classes):
     correction_constant = 1 / (num_classes * num_points_in_partition)
 
     zero_posterior_idxs = np.where(posteriors == 0)[0]
-
-    c = len(zero_posterior_idxs) / (num_classes * num_points_in_partition)
-    posteriors *= (1 - c)
     posteriors[zero_posterior_idxs] = correction_constant
+    
+    posteriors /= sum(posteriors)
+    
     return posteriors
 
 class UncertaintyForest(BaseEstimator, ClassifierMixin):
@@ -75,7 +75,7 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
         max_samples = 0.63,
         max_features_tree = "auto",
         n_estimators=200,
-        bootstrap=False,
+        bootstrap=True,
         parallel=True):
 
         #Tree parameters.
@@ -188,7 +188,7 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
                         #finite sample correction
                         posteriors_corrected = _finite_sample_correction(posteriors, len(cal_idxs_of_node_id), len(self.classes_))
                         node_ids_to_posterior_map[node_id] = posteriors_corrected
-
+                        
                     #add the node_ids_to_posterior_map to the overall tree_idx map 
                     self.tree_idx_to_node_ids_to_posterior_map[tree_idx] = node_ids_to_posterior_map
                     
@@ -458,15 +458,6 @@ task = range(0,10)
 iterable = product(task,trees)
 
 Parallel(n_jobs=-2,verbose=1)(delayed(run_parallel_exp)(data_x, data_y, class_idx, ntrees, task_) for task_,ntrees in iterable)
-
-
-# In[77]:
-
-
-import os.path
-from os import path
-
-path.exists('/data/Jayanta/continual-learning/control_res')
 
 
 # In[ ]:
