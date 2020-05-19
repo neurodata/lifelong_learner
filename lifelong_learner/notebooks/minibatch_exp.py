@@ -274,7 +274,7 @@ class LifeLongForest():
                    lr = 5e-4, 
                    n_estimators = 10, 
                    max_samples = .63,
-                   bootstrap = Flase,
+                   bootstrap = False,
                    max_depth = 30,
                    min_samples_leaf = 1,
                    acorn = None):
@@ -433,13 +433,13 @@ def exp(data_x, data_y, class_idx, cv, ntrees=100, acorn=None):
 
 
 n_tasks = 10
-train_file = '/data/Jayanta/continual-learning/train'
+train_file = '/home/ubuntu/train'
 unpickled_train = unpickle(train_file)
 train_keys = list(unpickled_train.keys())
 fine_labels = np.array(unpickled_train[train_keys[2]])
 labels = fine_labels
 
-test_file = '/data/Jayanta/continual-learning/test'
+test_file = '/home/ubuntu/test'
 unpickled_test = unpickle(test_file)
 test_keys = list(unpickled_test.keys())
 fine_labels = np.array(unpickled_test[test_keys[2]])
