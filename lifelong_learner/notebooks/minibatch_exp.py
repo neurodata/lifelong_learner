@@ -451,11 +451,14 @@ data_y = np.concatenate((labels, labels_), axis=0)
 class_idx = [np.where(data_y == u)[0] for u in np.unique(data_y)]
 
 
+Parallel(n_jobs=-2,verbose=1)(
+    delayed(exp)(
+        data_x, data_y, class_idx, i, ntrees=200, acorn=i) for i in range(1,7,1)
+)
 
-
-for i in range(1,7,1):
-    print("Doing %d fold"%i)
-    exp(data_x, data_y, class_idx, i, ntrees=200, acorn=i)
+#for i in range(1,7,1):
+#    print("Doing %d fold"%i)
+#    exp(data_x, data_y, class_idx, i, ntrees=200, acorn=i)
 
 
 
