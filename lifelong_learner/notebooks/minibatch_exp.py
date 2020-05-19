@@ -49,7 +49,6 @@ def homogenize_labels(a):
 
 # In[15]:
 
-
 def _finite_sample_correction(posteriors, num_points_in_partition, num_classes):
     '''
     encourage posteriors to approach uniform when there is low data
@@ -57,10 +56,10 @@ def _finite_sample_correction(posteriors, num_points_in_partition, num_classes):
     correction_constant = 1 / (num_classes * num_points_in_partition)
 
     zero_posterior_idxs = np.where(posteriors == 0)[0]
-
-    c = len(zero_posterior_idxs) / (num_classes * num_points_in_partition)
-    posteriors *= (1 - c)
     posteriors[zero_posterior_idxs] = correction_constant
+    
+    posteriors /= sum(posteriors)
+    
     return posteriors
 
 class UncertaintyForest(BaseEstimator, ClassifierMixin):
@@ -170,8 +169,9 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
 
                 def worker(tree_idx):
                     nodes = nodes_across_trees[tree_idx]
-                    cal_nodes = nodes[self.estimators_samples_[tree_idx]] if fitting else nodes
-                    y_cal = y[self.estimators_samples_[tree_idx]] if fitting else y                    
+                    oob_samples = np.delete(range(len(nodes)), self.estimators_samples_[tree_idx])
+                    cal_nodes = nodes[oob_samples] if fitting else nodes
+                    y_cal = y[oob_samples] if fitting else y                    
                     
                     #create a map from the unique node ids to their classwise posteriors
                     node_ids_to_posterior_map = {}
@@ -186,7 +186,7 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
                         #finite sample correction
                         posteriors_corrected = _finite_sample_correction(posteriors, len(cal_idxs_of_node_id), len(self.classes_))
                         node_ids_to_posterior_map[node_id] = posteriors_corrected
-
+                        
                     #add the node_ids_to_posterior_map to the overall tree_idx map 
                     self.tree_idx_to_node_ids_to_posterior_map[tree_idx] = node_ids_to_posterior_map
                     
@@ -242,7 +242,6 @@ class UncertaintyForest(BaseEstimator, ClassifierMixin):
 
 # In[16]:
 
-
 class LifeLongForest():
     def __init__(self, acorn = None, verbose = False, model = "uf"):
         self.X_across_tasks = []
@@ -274,7 +273,7 @@ class LifeLongForest():
                    lr = 5e-4, 
                    n_estimators = 10, 
                    max_samples = .63,
-                   bootstrap = False,
+                   bootstrap = True,
                    max_depth = 30,
                    min_samples_leaf = 1,
                    acorn = None):
