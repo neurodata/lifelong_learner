@@ -273,7 +273,7 @@ class LifeLongForest():
                    lr = 5e-4, 
                    n_estimators = 10, 
                    max_samples = .63,
-                   bootstrap = True,
+                   bootstrap = False,
                    max_depth = 30,
                    min_samples_leaf = 1,
                    acorn = None):
@@ -454,7 +454,7 @@ class_idx = [np.where(data_y == u)[0] for u in np.unique(data_y)]
 
 
 trees = range(10,300,10)
-task = range(6,10)
+task = range(0,10)
 iterable = product(task,trees)
 
 Parallel(n_jobs=30,verbose=1)(delayed(run_parallel_exp)(data_x, data_y, class_idx, ntrees, task_) for task_,ntrees in iterable)
