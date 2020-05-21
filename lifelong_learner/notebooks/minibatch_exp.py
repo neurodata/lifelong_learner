@@ -10,6 +10,7 @@ import seaborn as sns
 import tqdm
 import pickle
 from itertools import product
+from math import log2, ceil
 
 from sklearn.ensemble import BaggingClassifier
 from sklearn.tree import DecisionTreeClassifier
@@ -271,17 +272,17 @@ class LifeLongForest():
                    y, 
                    epochs = 100, 
                    lr = 5e-4, 
-                   n_estimators = 10, 
+                   n_estimators = 100, 
                    max_samples = .63,
-                   bootstrap = True,
+                   bootstrap = False,
                    max_depth = 30,
                    min_samples_leaf = 1,
                    acorn = None):
         
-        #if self.model == "dnn":
-        #    from honest_dnn import HonestDNN 
-        #if self.model == "uf":
-        #    from uncertainty_forest import UncertaintyForest
+       # if self.model == "dnn":
+       #     from honest_dnn import HonestDNN 
+       # if self.model == "uf":
+       #     from uncertainty_forest import UncertaintyForest
         
         self.X_across_tasks.append(X)
         self.y_across_tasks.append(y)
@@ -347,21 +348,27 @@ class LifeLongForest():
         elif isinstance(representation, int):
             representation = np.array([representation])
         
-        posteriors_across_tasks = []
-        for transformer_task_idx in representation:
+        def worker(transformer_task_idx):
             transformer = self.transformers_across_tasks[transformer_task_idx]
             voter = self.voters_across_tasks_matrix[decider][transformer_task_idx]
             if self.model == "dnn":
-                posteriors_across_tasks.append(voter.predict_proba(transformer.predict(X)))
+                return voter.predict_proba(transformer.predict(X))
             if self.model == "uf":
-                posteriors_across_tasks.append(voter.predict_proba(transformer(X)))
+                return voter.predict_proba(transformer(X))
+        
+        posteriors_across_tasks = np.array(
+                    Parallel(n_jobs=-1)(
+                            delayed(worker)(transformer_task_idx) for transformer_task_idx in representation
+                    )
+            )    
+            
         return np.mean(posteriors_across_tasks, axis = 0)
-    
+        
     def predict(self, X, representation = 0, decider = 0):
         task_classes = self.classes_across_tasks[decider]
-        return task_classes[np.argmax(self._estimate_posteriors(X, representation, decider), axis = -1)] 
-
-
+        return task_classes[np.argmax(self._estimate_posteriors(X, representation, decider), axis = -1)]
+    
+    
 # In[31]:
 
 
@@ -409,17 +416,17 @@ def exp(data_x, data_y, class_idx, cv, ntrees=100, acorn=None):
     lifelong_forest = LifeLongForest()
     
     for ii in range(100):
-        lifelong_forest.new_forest(train_x[ii*500:(ii+1)*500,:], homogenize_labels(train_y[ii*500:(ii+1)*500]), n_estimators=ntrees)
+        lifelong_forest.new_forest(train_x[ii*500:(ii+1)*500,:], train_y[ii*500:(ii+1)*500], max_depth=ceil(log2(500)), n_estimators=ntrees)
         #lifelong_forest.new_forest(train_x[(ii-1)*5000:(ii)*5000,:], homogenize_labels(train_y[(ii-1)*5000:(ii)*5000]), n_estimators=ntrees)
         
         task_id  = ii//10
         llf_task=lifelong_forest.predict(test_x[task_id*1000:(task_id+1)*1000,:], representation=ii, decider=ii)
-        errors_1[ii] = 1 - np.sum(llf_task == homogenize_labels(test_y[task_id*1000:(task_id+1)*1000]))/m
+        errors_1[ii] = 1 - np.sum(llf_task == test_y[task_id*1000:(task_id+1)*1000])/m
         
         for jj in range(ii+1):
             task_id  = jj//10
             llf_task=lifelong_forest.predict(test_x[task_id*1000:(task_id+1)*1000,:], representation='all', decider=jj)
-            errors[ii].append(1 - np.sum(llf_task == homogenize_labels(test_y[task_id*1000:(task_id+1)*1000]))/m)
+            errors[ii].append(1 - np.sum(llf_task == test_y[task_id*1000:(task_id+1)*1000])/m)
             
     with open('../result/'+'LF'+str(cv)+'.pickle', 'wb') as f:
         pickle.dump(errors, f)
@@ -452,7 +459,7 @@ class_idx = [np.where(data_y == u)[0] for u in np.unique(data_y)]
 
 Parallel(n_jobs=-2,verbose=1)(
     delayed(exp)(
-        data_x, data_y, class_idx, i, ntrees=200, acorn=i) for i in range(1,7,1)
+        data_x, data_y, class_idx, i, ntrees=100, acorn=i) for i in range(1,7,1)
 )
 
 #for i in range(1,7,1):
