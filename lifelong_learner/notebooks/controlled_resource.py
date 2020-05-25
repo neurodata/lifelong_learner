@@ -5,6 +5,7 @@ import seaborn as sns
 import tqdm
 import pickle
 from itertools import product
+from math import log2, ceil
 
 from sklearn.ensemble.forest import _generate_unsampled_indices
 from sklearn.ensemble.forest import _generate_sample_indices
@@ -395,11 +396,11 @@ def LF_experiment(train_x, train_y, test_x, test_y, task, ntrees, cv, acorn=None
     m = 1000
     lifelong_forest = LifeLongForest()
     lifelong_forest.new_forest(train_x, 
-                               homogenize_labels(train_y), n_estimators=ntrees)
+                               train_y, max_depth = ceil(log2(5000)), n_estimators=ntrees)
         
      
     llf_single_task=lifelong_forest.predict(test_x, representation=0, decider=0)
-    err = 1 - np.sum(llf_single_task == homogenize_labels(test_y))/m
+    err = 1 - np.sum(llf_single_task == test_y)/m
     
     return err
 
