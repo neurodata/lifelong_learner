@@ -24,7 +24,7 @@ import tensorflow.keras as keras
 
 def unpickle(file):
     with open(file, 'rb') as fo:
-        dict = pickle.load(fo, encoding='bytes')
+        dict = pickle.load(fo)
     return dict
 
 def data_shape_continual_learn(X):
